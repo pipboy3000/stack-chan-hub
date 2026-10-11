@@ -1,0 +1,10 @@
+# Keeps the official NVS (servo calibration, BLE bonds) and PHY regions.
+# Two app slots for over-the-air updates via Wi-Fi (tools/ota.sh).
+# The first USB flash after switching to this table must also write
+# build/ota_data_initial.bin at 0xd000 so the bootloader starts ota_0.
+# Name, Type, SubType, Offset, Size
+nvs, data, nvs, 0x9000, 0x4000
+otadata, data, ota, 0xd000, 0x2000
+phy_init, data, phy, 0xf000, 0x1000
+ota_0, app, ota_0, 0x10000, 0x300000
+ota_1, app, ota_1, 0x310000, 0x300000

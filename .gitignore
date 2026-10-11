@@ -1,0 +1,8 @@
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+.idf_component_manager/
+components/*/test_host/*_test
+.ota-token
+.cache/
