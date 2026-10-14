@@ -9,7 +9,7 @@ Voyager + Navigator → USB → Stack-chan → BLE → 選択したPC
 
 ## 必要なもの
 
-- M5Stack StackChan K151（CoreS3 / ESP32-S3、16MB Flash）と台座。
+- M5Stack公式のStackChan（CoreS3 / ESP32-S3、16MB Flash）と台座。
 - ZSA Voyager。タッチパッドも使う場合はNavigator。
 - Voyagerと本体をつなぐUSBケーブル、初回書き込み用のUSBデータケーブル。
 - 台座へ給電するUSB電源と、データ通信をしない給電専用ケーブル。
@@ -84,3 +84,13 @@ Oryx/Keymappで設定を変更するときはVoyagerをPCへ直接USB接続し�
 - [開発構成・テスト・診断](docs/development.md)
 - [開発・実機検証の時系列記録](docs/development-log.md)
 - [VoyagerのUSB記述子](docs/voyager-descriptors.md)
+
+## ライセンス
+
+[MIT License](LICENSE)。同梱している次のコンポーネントは、それぞれのディレクトリにある
+ライセンス（いずれもMIT）に従います。
+
+- `components/stackchan_bsp/`：M5Stackの[StackChan-BSP](https://github.com/m5stack/StackChan-BSP)。
+  motion taskの優先度を変更しています。内部の `src/utils/uitk/` と `src/drivers/FTServo_Arduino/` は
+  それぞれのLICENSEを含みます。
+- `components/m5stack_avatar/`：Shinya Ishikawa氏の[m5stack-avatar](https://github.com/stack-chan/m5stack-avatar)（現在はビルド対象外）。

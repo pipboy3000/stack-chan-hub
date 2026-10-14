@@ -1,7 +1,7 @@
 # セットアップ
 
 [README](../README.md)から初めて試す人向けの詳細手順です。
-確認済みの機体はStackChan K151 / CoreS3、ESP32-S3、16MB Flashです。
+確認済みの機体はM5Stack公式のStackChan（CoreS3）、ESP32-S3、16MB Flashです。
 
 ## 1. 開発環境を準備する
 
