@@ -11,11 +11,13 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 #include "hid_descriptor.h"
 #include "input_router.h"
+#include "led_model.h"
 #include "touchpad_gestures.h"
 #include "ui_model.h"
 #include "ui_view.h"
@@ -89,6 +91,7 @@ enum class RouterEventKind : uint8_t {
   kUiSelectSlot,
   kUiStartPairing,
   kUiUnbind,
+  kUiSleep,
 };
 
 struct RouterEvent {
@@ -98,6 +101,7 @@ struct RouterEvent {
   uint16_t usage;
   input_router::MouseReport mouse;
   touchpad::Frame touch;  // time_ms is set by router_task
+  TaskHandle_t reply_task;  // sleep preparation acknowledgement
 };
 
 // One opened HID interface of the Voyager. Written by hid_event_task before
@@ -120,6 +124,7 @@ std::atomic<uint32_t> dropped_reports{0};
 std::atomic<uint32_t> ble_send_failures{0};
 // Liveness counters shown on the LCD: USB host mode has no serial log.
 std::atomic<uint32_t> usb_input_count{0};
+std::atomic<uint32_t> input_activity_count{0};
 std::atomic<uint32_t> router_loop_count{0};
 std::atomic<uint32_t> ui_loop_count{0};
 // Base battery (INA226), sampled by ui_task, which owns the I2C bus.
@@ -438,8 +443,11 @@ void log_touch_frame(const touchpad::Frame& frame) {
     return;
   }
   last_mask = mask;
-  ESP_LOGI(kTag, "touch ids=%02x count=%u c0=%u/%d/%d(%ld,%ld) c1=%u/%d/%d(%ld,%ld)",
-           mask, frame.contact_count, frame.contacts[0].id,
+  ESP_LOGI(kTag,
+           "touch ids=%02x count=%u max=%ld,%ld c0=%u/%d/%d(%ld,%ld) "
+           "c1=%u/%d/%d(%ld,%ld)",
+           mask, frame.contact_count, static_cast<long>(frame.max_x),
+           static_cast<long>(frame.max_y), frame.contacts[0].id,
            frame.contacts[0].touching, frame.contacts[0].confident,
            static_cast<long>(frame.contacts[0].x),
            static_cast<long>(frame.contacts[0].y), frame.contacts[1].id,
@@ -491,6 +499,12 @@ void router_task(void*) {
     }
     switch (event.kind) {
       case RouterEventKind::kUsbReport: {
+        for (const uint8_t key : event.report) {
+          if (key != 0) {
+            ++input_activity_count;
+            break;
+          }
+        }
         input_router::KeyboardReport report;
         report.modifiers = event.report[0];
         memcpy(report.keys, &event.report[2], input_router::kKeyCount);
@@ -498,15 +512,26 @@ void router_task(void*) {
         break;
       }
       case RouterEventKind::kUsbConsumer:
+        if (event.usage != 0) ++input_activity_count;
         router.OnUsbConsumerReport(event.usage, actions);
         break;
       case RouterEventKind::kUsbSystem:
+        if (event.usage != 0) ++input_activity_count;
         router.OnUsbSystemReport(event.usage, actions);
         break;
       case RouterEventKind::kUsbMouse:
+        if (event.mouse.buttons || event.mouse.x || event.mouse.y ||
+            event.mouse.wheel || event.mouse.pan) ++input_activity_count;
         router.OnUsbMouseReport(event.mouse, actions);
         break;
       case RouterEventKind::kUsbTouch:
+        if (event.touch.buttons) ++input_activity_count;
+        for (const auto& contact : event.touch.contacts) {
+          if (contact.touching && contact.confident) {
+            ++input_activity_count;
+            break;
+          }
+        }
         event.touch.time_ms = now_ms();
         log_touch_frame(event.touch);
         route_touch_outputs(router, touch_outputs,
@@ -555,6 +580,28 @@ void router_task(void*) {
           post_ui(UiKind::kBle, "解除を開始できません");
         }
         break;
+      case RouterEventKind::kUiSleep: {
+        // Drop pending motion/presses, then send only the final neutral state.
+        outbox_clear();
+        gestures.Reset(touch_outputs);
+        router.Reset(actions);
+        execute(router, actions);
+        for (int i = 0; i < 10 && !outbox_pump(); ++i) {
+          vTaskDelay(kRetryInterval);
+        }
+        const bool released = outbox_count == 0 || !ble_secured;
+        outbox_clear();
+        actions.count = 0;
+        // Stop accepting input before UI shuts the transport down. A failed
+        // release is recovered by reboot; never leave input running into sleep.
+        if (!released) {
+          ESP_LOGE(kTag, "sleep release was not accepted; restarting");
+          esp_restart();
+        }
+        xTaskNotifyGive(event.reply_task);
+        vTaskSuspend(nullptr);
+        break;
+      }
     }
     execute(router, actions);
     outbox_pump();
@@ -696,6 +743,8 @@ void on_hid_interface_event(hid_host_device_handle_t handle,
       for (size_t i = 0;
            i < info->finger_count && i < touchpad::kMaxContacts; ++i) {
         const hid_descriptor::Finger& finger = info->fingers[i];
+        routed.touch.max_x = finger.x.logical_max;
+        routed.touch.max_y = finger.y.logical_max;
         touchpad::Contact& contact = routed.touch.contacts[i];
         contact.touching =
             hid_descriptor::Extract(payload, payload_size, finger.tip) != 0;
@@ -970,6 +1019,8 @@ const char* reset_reason_name(esp_reset_reason_t reason) {
       return "power on";
     case ESP_RST_SW:
       return "software";
+    case ESP_RST_DEEPSLEEP:
+      return "deep sleep";
     case ESP_RST_PANIC:
       return "PANIC";
     case ESP_RST_INT_WDT:
@@ -1040,18 +1091,13 @@ UsbRun apply_power(ui::PowerSetting setting, char* notice, size_t size) {
   return UsbRun::kInternal;
 }
 
-void show_run(UsbRun run) {
-  switch (run) {
-    case UsbRun::kInternal:
-      M5StackChan.showRgbColor(0, 32, 0);
-      break;
-    case UsbRun::kExternal:
-      M5StackChan.showRgbColor(0, 0, 32);
-      break;
-    default:
-      M5StackChan.showRgbColor(32, 0, 0);
-      break;
+// Base LEDs 0-5 are on the left, 6-11 on the right.
+void show_leds(const led::Pattern& pattern) {
+  for (uint8_t i = 0; i < 12; ++i) {
+    const led::Color& color = i < 6 ? pattern.left : pattern.right;
+    M5StackChan.setRgbColor(i, color.r, color.g, color.b);
   }
+  M5StackChan.refreshRgb();
 }
 
 const char* ble_event_message(ble_keyboard::LinkEvent event) {
@@ -1098,20 +1144,22 @@ void ui_task(void*) {
     ESP_LOGE(kTag, "UI canvas allocation failed");
   }
 
-  // After an OTA update (software reset) no Mac is on the CoreS3 USB-C, so
-  // the last run mode is resumed without the countdown.
+  // Resume the saved supply mode after software reset or manual hibernation.
   const auto last_run = static_cast<UsbRun>(load_setting("run", 0));
-  const bool resuming = esp_reset_reason() == ESP_RST_SW &&
+  const bool resuming = (esp_reset_reason() == ESP_RST_SW ||
+                         esp_reset_reason() == ESP_RST_DEEPSLEEP) &&
                         (last_run == UsbRun::kInternal ||
-                         last_run == UsbRun::kExternal);
+                         last_run == UsbRun::kExternal ||
+                         (esp_reset_reason() == ESP_RST_DEEPSLEEP &&
+                          last_run == UsbRun::kWithoutUsb));
   // Otherwise VBUS stays off until the start: the Mac may be on the USB-C.
   if (!(resuming && last_run == UsbRun::kInternal)) {
     M5.Power.setUsbOutput(false);
   }
-  show_run(UsbRun::kNone);
 
   UsbRun run = UsbRun::kNone;
   bool usb_started = false;
+  bool usb_start_failed = false;
   char start_notice[64] = "";
   char usb_status[96] = "";
   char aux[96] = "";
@@ -1121,9 +1169,9 @@ void ui_task(void*) {
   auto start = [&](ui::PowerSetting setting) {
     run = apply_power(setting, start_notice, sizeof(start_notice));
     save_setting("run", static_cast<uint8_t>(run));
-    show_run(run);
     if (!usb_started) {
       usb_started = start_usb_host();
+      usb_start_failed = !usb_started;
       if (!usb_started) {
         snprintf(start_notice, sizeof(start_notice),
                  "USBホストを開始できません");
@@ -1133,7 +1181,12 @@ void ui_task(void*) {
 
   model.Begin(now_ms(), !resuming);
   if (resuming) {
-    start(model.power());
+    if (last_run == UsbRun::kWithoutUsb) {
+      run = last_run;
+    } else {
+      start(last_run == UsbRun::kInternal ? ui::PowerSetting::kInternal
+                                         : ui::PowerSetting::kExternal);
+    }
   }
 
   ui::Status shown;
@@ -1144,11 +1197,19 @@ void ui_task(void*) {
   TickType_t last_sample = 0;
   TickType_t last_periodic_draw = 0;
   bool was_dimmed = false;
+  bool was_off = false;
+  uint32_t seen_inputs = input_activity_count;
+  led::Pattern shown_leds{led::kRed, led::kRed};
+  show_leds(shown_leds);
   while (true) {
     ++ui_loop_count;
     const uint32_t now = now_ms();
     M5StackChan.update();
 
+    if (const uint32_t inputs = input_activity_count; inputs != seen_inputs) {
+      seen_inputs = inputs;
+      model.Activity(now);
+    }
     ui::Command command = model.OnTick(now);
     const auto touch = M5.Touch.getDetail();
     if (command.type == ui::CommandType::kNone && touch.wasPressed()) {
@@ -1194,6 +1255,36 @@ void ui_task(void*) {
       case ui::CommandType::kRestart:
         esp_restart();
         break;
+      case ui::CommandType::kSleep: {
+        RouterEvent sleep{};
+        sleep.kind = RouterEventKind::kUiSleep;
+        sleep.reply_task = xTaskGetCurrentTaskHandle();
+        // Unlike ordinary LCD requests, sleep cannot proceed without an ack.
+        if (xQueueSend(router_events, &sleep, pdMS_TO_TICKS(100)) != pdTRUE) {
+          snprintf(start_notice, sizeof(start_notice), "休止を開始できません");
+          model.Wake(now);
+          break;
+        }
+        if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000)) == 0 ||
+            !ble_keyboard::StopForSleep()) {
+          ESP_LOGE(kTag, "sleep shutdown failed; restarting");
+          esp_restart();
+        }
+        const esp_err_t wifi_stop = esp_wifi_stop();
+        if (wifi_stop != ESP_OK && wifi_stop != ESP_ERR_WIFI_NOT_INIT) {
+          ESP_LOGE(kTag, "sleep Wi-Fi stop failed; restarting");
+          esp_restart();
+        }
+        show_leds({led::kOff, led::kOff});
+        M5.Display.setBrightness(0);
+        if (run == UsbRun::kInternal) M5.Power.setUsbOutput(false);
+        M5.Power.deepSleep(M5.Power.sleep_no_timer, true);
+        // A wake-pin/I2C failure can make deepSleep return. BLE is stopped and
+        // Router is parked, so reboot to restore operation rather than hang.
+        ESP_LOGE(kTag, "deep sleep did not start; restarting");
+        esp_restart();
+        break;
+      }
     }
 
     while (xQueueReceive(ui_messages, &message, 0) == pdTRUE) {
@@ -1257,11 +1348,28 @@ void ui_task(void*) {
     model.SetHomeSlots(slots[2].registered || status.active_slot == 2 ? 3 : 2);
 
     const bool dimmed = model.Dimmed(now);
-    if (dimmed != was_dimmed || command.type ==
-                                    ui::CommandType::kSetBrightness) {
+    const bool off = model.ScreenOff(now);
+    if (dimmed != was_dimmed || off != was_off ||
+        command.type == ui::CommandType::kSetBrightness) {
       was_dimmed = dimmed;
-      M5.Display.setBrightness(dimmed ? kDimmedBrightness
-                                      : kBrightness[model.brightness()]);
+      was_off = off;
+      M5.Display.setBrightness(
+          off ? 0 : (dimmed ? kDimmedBrightness
+                            : kBrightness[model.brightness()]));
+    }
+
+    led::Input leds{};
+    leds.slot = status.active_slot;
+    leds.connected = status.link == ui::Link::kConnected;
+    leds.keyboard_missing = status.keyboard == ui::Keyboard::kWaiting;
+    leds.error = usb_start_failed ||
+        slots[status.active_slot].last_error != ble_keyboard::ManagementError::kNone;
+    leds.on_battery = !status.external_power && !status.charging;
+    leds.screen_off = off;
+    if (const led::Pattern pattern = led::Compute(leds, now);
+        !(pattern == shown_leds)) {
+      shown_leds = pattern;
+      show_leds(pattern);
     }
 
     // Screens with a clock or live values are redrawn on a timer as well.

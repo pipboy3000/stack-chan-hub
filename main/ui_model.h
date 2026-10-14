@@ -64,8 +64,11 @@ enum SettingsRow : int {
   kRowBrightness,
   kRowDiagnostics,
   kRowRestart,
+  kRowSleep,
   kSettingsRowCount,
 };
+static_assert(kHeaderHeight + kSettingsRowCount * kRowHeight <= kHeight,
+              "Settings rows must fit the LCD");
 
 enum class CommandType : uint8_t {
   kNone,
@@ -78,6 +81,7 @@ enum class CommandType : uint8_t {
   kStopPairing,
   kUnbind,         // value: slot
   kRestart,
+  kSleep,
 };
 
 struct Command {
@@ -89,12 +93,13 @@ class Model {
  public:
   static constexpr uint32_t kBootCountdownMs = 3000;
   static constexpr uint32_t kDimAfterMs = 30000;
+  static constexpr uint32_t kOffAfterMs = 5 * 60 * 1000;
   static constexpr uint32_t kRestartArmMs = 3000;
 
   // `countdown` false skips the boot screens (resume after a software reset).
   void Begin(uint32_t now_ms, bool countdown) {
     screen_ = countdown ? Screen::kBoot : Screen::kHome;
-    boot_started_ms_ = last_touch_ms_ = now_ms;
+    boot_started_ms_ = last_touch_ms_ = last_input_ms_ = now_ms;
     dirty_ = true;
   }
 
@@ -106,7 +111,9 @@ class Model {
       return {};
     }
     const bool restart_armed = RestartArmed(now_ms);
+    const bool sleep_armed = SleepArmed(now_ms);
     restart_armed_ms_ = 0;
+    sleep_armed_ms_ = 0;
     dirty_ = true;
     switch (screen_) {
       case Screen::kBoot:
@@ -142,7 +149,7 @@ class Model {
           return {};
         }
         return OnSettingsRow(RowAt(x, y, kSettingsRowCount), restart_armed,
-                             now_ms);
+                             sleep_armed, now_ms);
       case Screen::kPower:
         if (kBackButton.Contains(x, y)) {
           screen_ = Screen::kSettings;
@@ -214,13 +221,23 @@ class Model {
       restart_armed_ms_ = 0;
       dirty_ = true;
     }
+    if (sleep_armed_ms_ != 0 && !SleepArmed(now_ms)) {
+      sleep_armed_ms_ = 0;
+      dirty_ = true;
+    }
     const bool dimmed = Dimmed(now_ms);
-    if (dimmed != was_dimmed_) {
+    const bool off = ScreenOff(now_ms);
+    if (dimmed != was_dimmed_ || off != was_off_) {
       was_dimmed_ = dimmed;
+      was_off_ = off;
       dirty_ = true;
     }
     return {};
   }
+
+  // Keyboard or touchpad input: keeps the screen from turning off, but
+  // leaves it dimmed so it does not light up while typing.
+  void Activity(uint32_t now_ms) { last_input_ms_ = now_ms; }
 
   // Lights the screen for something the user should see (slot switch, error).
   void Wake(uint32_t now_ms) {
@@ -237,6 +254,12 @@ class Model {
     return now_ms - last_touch_ms_ >= kDimAfterMs;
   }
 
+  // Dark after kOffAfterMs without a touch, a wake or any input.
+  bool ScreenOff(uint32_t now_ms) const {
+    return Dimmed(now_ms) && now_ms - last_touch_ms_ >= kOffAfterMs &&
+           now_ms - last_input_ms_ >= kOffAfterMs;
+  }
+
   int BootSecondsLeft(uint32_t now_ms) const {
     const uint32_t elapsed = now_ms - boot_started_ms_;
     return elapsed >= kBootCountdownMs
@@ -247,6 +270,11 @@ class Model {
   bool RestartArmed(uint32_t now_ms) const {
     return restart_armed_ms_ != 0 &&
            now_ms - restart_armed_ms_ < kRestartArmMs;
+  }
+
+  bool SleepArmed(uint32_t now_ms) const {
+    return sleep_armed_ms_ != 0 &&
+           now_ms - sleep_armed_ms_ < kRestartArmMs;
   }
 
   // State of the host shown on kHost, refreshed by the caller.
@@ -306,7 +334,8 @@ class Model {
     return {type, value};
   }
 
-  Command OnSettingsRow(int row, bool restart_armed, uint32_t now_ms) {
+  Command OnSettingsRow(int row, bool restart_armed, bool sleep_armed,
+                        uint32_t now_ms) {
     switch (row) {
       case kRowHosts:
         screen_ = Screen::kHosts;
@@ -327,6 +356,12 @@ class Model {
         }
         restart_armed_ms_ = now_ms == 0 ? 1 : now_ms;  // second tap confirms
         return {};
+      case kRowSleep:
+        if (sleep_armed) {
+          return {CommandType::kSleep, 0};
+        }
+        sleep_armed_ms_ = now_ms == 0 ? 1 : now_ms;
+        return {};
       default:
         return {};
     }
@@ -335,8 +370,11 @@ class Model {
   Screen screen_ = Screen::kHome;
   uint32_t boot_started_ms_ = 0;
   uint32_t last_touch_ms_ = 0;
+  uint32_t last_input_ms_ = 0;
   uint32_t restart_armed_ms_ = 0;  // 0 = not armed
+  uint32_t sleep_armed_ms_ = 0;
   bool was_dimmed_ = false;
+  bool was_off_ = false;
   bool dirty_ = true;
   uint8_t host_ = 0;
   bool host_registered_ = false;

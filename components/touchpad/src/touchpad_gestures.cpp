@@ -24,6 +24,30 @@ uint8_t Gestures::Buttons() const {
   return pad_buttons_ | (tap_button_ ? kLeft : 0);
 }
 
+bool Gestures::NearTap(const Track& contact) const {
+  const int64_t dx = static_cast<int64_t>(contact.last_x) - tap_x_;
+  const int64_t dy = static_cast<int64_t>(contact.last_y) - tap_y_;
+  const int64_t slop =
+      static_cast<int64_t>(config_.drag_slop_mm) * config_.units_per_mm;
+  return dx * dx + dy * dy <= slop * slop;
+}
+
+bool Gestures::AtEdge() const {
+  // Zero holds wherever the finger lifts; so does a device without maxima.
+  if (config_.redrag_edge_mm <= 0 || max_x_ <= 0 || max_y_ <= 0) return true;
+  const int64_t edge =
+      static_cast<int64_t>(config_.redrag_edge_mm) * config_.units_per_mm;
+  for (size_t i = 0; i < track_count_; ++i) {
+    const Track& contact = tracks_[i];
+    if (contact.last_x <= edge || contact.last_y <= edge ||
+        static_cast<int64_t>(max_x_) - contact.last_x <= edge ||
+        static_cast<int64_t>(max_y_) - contact.last_y <= edge) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void Gestures::Emit(MouseOutput* out, size_t& count, int16_t dx, int16_t dy,
                     int16_t wheel, int16_t pan) {
   if (count == kMaxOutputs) {
@@ -126,6 +150,14 @@ size_t Gestures::OnFrame(const Frame& frame, MouseOutput* out) {
 
   const uint8_t previous_buttons = Buttons();
   pad_buttons_ = frame.buttons;
+  // A frame can arrive before OnTick services an expired tap or continuation.
+  // Release first so a late touch cannot revive the old drag.
+  if (tap_release_at_ != 0 && reached(now, tap_release_at_)) {
+    tap_release_at_ = 0;
+    tap_button_ = false;
+    redrag_ = false;
+    Emit(out, count);
+  }
 
   if (touching_count == 0) {
     if (phase_ != Phase::kIdle) {
@@ -133,6 +165,8 @@ size_t Gestures::OnFrame(const Frame& frame, MouseOutput* out) {
       if (phase_ == Phase::kTouch && quick) {
         if (max_fingers_ == 1) {
           // Press now, release after the drag window (OnTick).
+          tap_x_ = tracks_[0].last_x;
+          tap_y_ = tracks_[0].last_y;
           tap_button_ = true;
           tap_release_at_ = deadline(now + config_.drag_window_ms);
           Emit(out, count);
@@ -144,14 +178,27 @@ size_t Gestures::OnFrame(const Frame& frame, MouseOutput* out) {
           Emit(out, count);
         }
       } else if (phase_ == Phase::kDragging) {
-        tap_button_ = false;
-        Emit(out, count);
-        if (drag_tap_ && quick) {
+        const bool drop_tap = redrag_ && quick &&
+            travel_ < config_.tap_slop_mm * config_.units_per_mm;
+        if (!drag_tap_ && !drop_tap && config_.redrag_ms != 0 && AtEdge()) {
+          redrag_ = true;
+          tap_release_at_ = config_.redrag_ms == kRedragNoLimit
+                                ? 0
+                                : deadline(now + config_.redrag_ms);
+        } else {
+          tap_button_ = false;
+          tap_release_at_ = 0;
+          Emit(out, count);
+        }
+        if (!redrag_ && drag_tap_ && quick) {
           // Tap, tap: the second tap is a click of its own (double click).
           tap_button_ = true;
           Emit(out, count);
           tap_button_ = false;
           Emit(out, count);
+        }
+        if (!tap_button_) {
+          redrag_ = false;
         }
       }
       phase_ = Phase::kIdle;
@@ -164,19 +211,28 @@ size_t Gestures::OnFrame(const Frame& frame, MouseOutput* out) {
     return count;
   }
 
+  // Synthetic lifts have no maxima, so remember them from contact frames.
+  max_x_ = frame.max_x;
+  max_y_ = frame.max_y;
+
   if (phase_ == Phase::kIdle) {
     touch_start_ms_ = now;
     swipe_armed_ = true;  // one swipe per touch, until all fingers lift
     two_finger_started_ = false;
     max_fingers_ = 0;
     travel_ = 0;
-    if (tap_release_at_ != 0) {
-      // Touched again right after a tap: keep the button down and drag.
+    phase_ = Phase::kTouch;
+    if (tap_release_at_ != 0 || redrag_) {
+      // Re-gripping an established drag may land anywhere. Starting a new
+      // drag requires one finger near the tap, not the next distant stroke.
+      if (redrag_ || (touching_count == 1 && NearTap(touching[0]))) {
+        phase_ = Phase::kDragging;
+        drag_tap_ = true;
+      } else {
+        tap_button_ = false;
+        Emit(out, count);  // complete the click before any pointer movement
+      }
       tap_release_at_ = 0;
-      phase_ = Phase::kDragging;
-      drag_tap_ = true;
-    } else {
-      phase_ = Phase::kTouch;
     }
   }
   if (touching_count > max_fingers_) {
@@ -267,6 +323,7 @@ size_t Gestures::OnTick(uint32_t time_ms, MouseOutput* out) {
       reached(time_ms, tap_release_at_)) {
     tap_release_at_ = 0;
     tap_button_ = false;
+    redrag_ = false;
     Emit(out, count);
   }
   return count;
@@ -281,6 +338,8 @@ size_t Gestures::Reset(MouseOutput* out) {
   tap_button_ = false;
   tap_release_at_ = 0;
   drag_tap_ = false;
+  redrag_ = false;
+  tap_x_ = tap_y_ = max_x_ = max_y_ = 0;
   rem_x_ = rem_y_ = rem_wheel_ = rem_pan_ = 0;
   if (held) {
     Emit(out, count);

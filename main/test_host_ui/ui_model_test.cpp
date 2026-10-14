@@ -90,6 +90,41 @@ void test_dimmed_touch_only_wakes() {
   CHECK(!model.Dimmed(100001));
 }
 
+void test_screen_turns_off_when_idle() {
+  Model model;
+  model.Begin(0, false);
+  CHECK(!model.ScreenOff(Model::kOffAfterMs - 1));
+  CHECK(model.ScreenOff(Model::kOffAfterMs));
+  // Typing keeps the screen on, but dimmed.
+  model.Activity(200000);
+  CHECK(model.Dimmed(Model::kOffAfterMs));
+  CHECK(!model.ScreenOff(200000 + Model::kOffAfterMs - 1));
+  CHECK(model.ScreenOff(200000 + Model::kOffAfterMs));
+  // Input brings a dark screen back, still dimmed.
+  model.Activity(600000);
+  CHECK(!model.ScreenOff(600001));
+  CHECK(model.Dimmed(600001));
+  // The first touch on a dark screen only wakes it.
+  CHECK(model.ScreenOff(1000000));
+  CHECK(touch(model, SlotButton(1, 2), 1000000).type == CommandType::kNone);
+  CHECK(!model.ScreenOff(1000001) && !model.Dimmed(1000001));
+  // Turning off and on redraws.
+  model.OnTick(1000001);
+  model.TakeDirty();
+  model.OnTick(1000000 + Model::kOffAfterMs);
+  CHECK(model.TakeDirty());
+}
+
+void test_screen_stays_on_while_pairing() {
+  Model model;
+  model.Begin(0, false);
+  touch(model, kSettingsButton, 10);
+  touch(model, ListRow(kRowHosts), 20);
+  touch(model, ListRow(0), 30);
+  model.SetHostState(false, true, false);
+  CHECK(!model.ScreenOff(Model::kOffAfterMs + 30));
+}
+
 void test_settings_rows() {
   Model model;
   model.Begin(0, false);
@@ -129,6 +164,35 @@ void test_restart_needs_two_taps() {
   // Another row in between disarms.
   touch(model, ListRow(kRowBrightness), 3600);
   CHECK(touch(model, ListRow(kRowRestart), 3700).type == CommandType::kNone);
+}
+
+void test_sleep_confirmation_and_layout() {
+  CHECK(ListRow(kRowSleep).y + ListRow(kRowSleep).h <= kHeight);
+  Model model;
+  model.Begin(0, false);
+  touch(model, kSettingsButton, 10);
+  CHECK(touch(model, ListRow(kRowSleep), 100).type == CommandType::kNone);
+  CHECK(model.SleepArmed(200) && !model.RestartArmed(200));
+  CHECK(touch(model, ListRow(kRowSleep), 200).type == CommandType::kSleep);
+  CHECK(!model.SleepArmed(201));
+  touch(model, ListRow(kRowSleep), 300);
+  model.OnTick(3300);
+  CHECK(!model.SleepArmed(3300));
+  CHECK(touch(model, ListRow(kRowSleep), 3300).type == CommandType::kNone);
+  touch(model, ListRow(kRowBrightness), 3400);
+  CHECK(!model.SleepArmed(3400));
+  CHECK(touch(model, ListRow(kRowSleep), 3500).type == CommandType::kNone);
+  // Restart and sleep require their own confirmation, never cross-confirm.
+  CHECK(touch(model, ListRow(kRowRestart), 3600).type == CommandType::kNone);
+  CHECK(!model.SleepArmed(3600) && model.RestartArmed(3600));
+  CHECK(touch(model, ListRow(kRowSleep), 3700).type == CommandType::kNone);
+  CHECK(!model.RestartArmed(3700));
+  touch(model, kBackButton, 3800);
+  CHECK(!model.SleepArmed(3800));
+  touch(model, kSettingsButton, 3900);
+  // A first tap on a dark screen only wakes, and does not arm sleep.
+  CHECK(touch(model, ListRow(kRowSleep), 400000).type == CommandType::kNone);
+  CHECK(!model.SleepArmed(400000));
 }
 
 void open_host(Model& model, int slot) {
@@ -187,8 +251,11 @@ int main() {
   test_resume_skips_boot();
   test_home_slot_buttons();
   test_dimmed_touch_only_wakes();
+  test_screen_turns_off_when_idle();
+  test_screen_stays_on_while_pairing();
   test_settings_rows();
   test_restart_needs_two_taps();
+  test_sleep_confirmation_and_layout();
   test_pairing_flow();
   test_unbind_needs_confirmation();
   if (failures != 0) {

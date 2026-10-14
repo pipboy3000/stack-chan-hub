@@ -190,6 +190,15 @@ inline int ble_npl_callout_reset(ble_npl_callout* callout, uint32_t ticks) {
 }
 inline void ble_npl_callout_stop(ble_npl_callout* callout) { callout->armed = false; }
 inline int nimble_port_init() { return 0; }
+inline int sleep_stop_rc = 0, sleep_deinit_rc = 0;
+inline int sleep_stop_calls = 0, sleep_deinit_calls = 0;
+inline void (*sleep_stop_hook)() = nullptr;
+inline int nimble_port_stop() {
+  ++sleep_stop_calls;
+  if (sleep_stop_rc == 0 && sleep_stop_hook) sleep_stop_hook();
+  return sleep_stop_rc;
+}
+inline int nimble_port_deinit() { ++sleep_deinit_calls; return sleep_deinit_rc; }
 inline void nimble_port_run() {}
 inline void nimble_port_freertos_deinit() {}
 inline void nimble_port_freertos_init(void (*)(void*)) {}

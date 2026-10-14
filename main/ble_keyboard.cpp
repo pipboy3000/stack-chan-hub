@@ -808,6 +808,18 @@ bool Unbind(uint8_t slot) {
   return enqueue_request({RequestKind::kUnbind, slot, 0});
 }
 
+bool StopForSleep() {
+  // Prevent disconnect callbacks and queued requests from restarting adverts.
+  if (!host_ready.exchange(false)) return false;
+  secured = false;
+  if (nimble_port_stop() != ESP_OK) return false;
+  // NimBLE can finish its stop procedure after a disconnect timeout too.
+  // Require the GAP disconnect callback before declaring a graceful stop.
+  if (conn_handle != BLE_HS_CONN_HANDLE_NONE) return false;
+  ble_npl_callout_stop(&pairing_timer);
+  return nimble_port_deinit() == ESP_OK;
+}
+
 SlotSnapshot SlotInfo(uint8_t slot) {
   if (slot >= PeerSlots::kCount) return {};
   portENTER_CRITICAL(&management_lock);

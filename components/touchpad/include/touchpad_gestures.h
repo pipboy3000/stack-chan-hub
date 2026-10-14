@@ -12,6 +12,7 @@
 namespace touchpad {
 
 constexpr size_t kMaxContacts = 5;
+constexpr uint32_t kRedragNoLimit = UINT32_MAX;
 
 struct Contact {
   uint8_t id = 0;
@@ -27,6 +28,8 @@ struct Frame {
   uint8_t contact_count = 0;
   uint8_t buttons = 0;  // physical pad buttons, bit 0 = left
   uint32_t time_ms = 0;
+  int32_t max_x = 0;  // logical coordinate maxima; 0 = unknown
+  int32_t max_y = 0;
 };
 
 struct Config {
@@ -44,8 +47,16 @@ struct Config {
   uint32_t tap_max_ms = 180;
   int32_t tap_slop_mm = 1;
   // After a one-finger tap the button stays down this long; touching again
-  // within it turns the tap into a drag.
+  // nearby within it turns the tap into a drag.
   uint32_t drag_window_ms = 200;
+  // A second one-finger touch must land this close to the previous tap.
+  int32_t drag_slop_mm = 4;
+  // After a moved tap-drag lifts, keep the button down (drag lock).
+  // Zero disables continuation; kRedragNoLimit holds until resumed/dropped.
+  // Other values bound the hold without changing the drag-start window.
+  uint32_t redrag_ms = kRedragNoLimit;
+  // Non-zero: only hold when the finger lifts this close to a pad edge.
+  int32_t redrag_edge_mm = 0;
   // With fingers down but no frame for this long, the touch counts as lifted.
   uint32_t lift_timeout_ms = 150;
   // A two-finger horizontal flick covering swipe_min_mm within swipe_max_ms
@@ -80,7 +91,7 @@ class Gestures {
   // Feeds one frame. Writes up to kMaxOutputs reports, returns the count.
   size_t OnFrame(const Frame& frame, MouseOutput* out);
 
-  // Completes time-based gestures (the delayed tap release).
+  // Completes time-based gestures (tap/re-drag release and missing lifts).
   size_t OnTick(uint32_t time_ms, MouseOutput* out);
 
   // Next time OnTick has work, or 0 when nothing is pending.
@@ -108,6 +119,8 @@ class Gestures {
   enum class TwoFinger : uint8_t { kUndecided, kScroll, kSwiped };
 
   uint8_t Buttons() const;
+  bool NearTap(const Track& contact) const;
+  bool AtEdge() const;
   void Emit(MouseOutput* out, size_t& count, int16_t dx = 0, int16_t dy = 0,
             int16_t wheel = 0, int16_t pan = 0);
   static int16_t Scale(int32_t& remainder, int32_t delta, int32_t num,
@@ -127,6 +140,11 @@ class Gestures {
   uint32_t last_frame_ms_ = 0;
   int32_t travel_ = 0;  // summed |dx| + |dy| since touch start
   bool drag_tap_ = false;  // the drag touch itself may still be a tap
+  bool redrag_ = false;  // holding or continuing a drag after repositioning
+  int32_t tap_x_ = 0;
+  int32_t tap_y_ = 0;
+  int32_t max_x_ = 0;
+  int32_t max_y_ = 0;
   uint8_t pad_buttons_ = 0;
   bool tap_button_ = false;
   uint32_t tap_release_at_ = 0;

@@ -178,6 +178,9 @@ void draw_settings(const Model& model, uint32_t now_ms) {
   } else {
     row(kRowRestart, "再起動", "");
   }
+  row(kRowSleep, "休止",
+      model.SleepArmed(now_ms) ? "もう一度タップで休止" : "画面タップで復帰",
+      model.SleepArmed(now_ms) ? kRed : kMuted);
 }
 
 void draw_power(const Model& model) {

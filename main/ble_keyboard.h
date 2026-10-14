@@ -74,6 +74,11 @@ bool StopPairing();
 // and retains the in-memory mapping for retry (reboot may reflect partial
 // storage changes). Do not offer a replacement until kUnbound.
 bool Unbind(uint8_t slot);
+// Terminal shutdown before deep sleep; call from UI, never a NimBLE callback.
+// Caller must first quiesce Router and send all-released. Stops advertising,
+// gracefully disconnects peers and deinitializes host/controller without
+// deleting bonds or slots. false means shutdown failed; reboot before reuse.
+bool StopForSleep();
 // Thread-safe value copy; never exposes Host-owned storage. Remaining time is
 // rounded up. Snapshot may lag a queued request until its Host handler runs.
 SlotSnapshot SlotInfo(uint8_t slot);

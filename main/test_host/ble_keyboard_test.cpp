@@ -22,6 +22,8 @@ int count(LinkEvent event) {
 }
 void reset() {
   fake_sdk::reset();
+  sleep_stop_rc = sleep_deinit_rc = sleep_stop_calls = sleep_deinit_calls = 0;
+  sleep_stop_hook = nullptr;
   pairing_active = pairing_link = false;
   pairing_slot = unbind_slot = kNoSlot;
   pairing_deadline = 0;
@@ -447,6 +449,38 @@ void cancel_termination_failure_is_visible() {
   assert(SlotInfo(2).last_error == ManagementError::kDisconnect);
   assert(!secured && count(LinkEvent::kPairingStopped) == 0);
 }
+
+void sleep_shutdown_preserves_bonds_and_stops_readvertising() {
+  connected0();
+  const int adverts = fake_sdk::adv_start_calls;
+  sleep_stop_hook = [] {
+    assert(!host_ready && !secured);
+    disconnect();  // SDK graceful stop completes the existing connection.
+  };
+  assert(StopForSleep());
+  assert(sleep_stop_calls == 1 && sleep_deinit_calls == 1);
+  assert(conn_handle == BLE_HS_CONN_HANDLE_NONE);
+  assert(fake_sdk::adv_start_calls == adverts && fake_sdk::delete_calls == 0);
+  assert(SlotInfo(0).registered && SlotInfo(1).registered);
+  assert(!SendKeyboard(0, kKeys) && !StartPairing(0));
+}
+
+void sleep_shutdown_failures_are_reported() {
+  connected0();
+  assert(!StopForSleep());  // stop returned, but GAP disconnect never arrived
+  assert(sleep_deinit_calls == 0);
+  connected0();
+  sleep_stop_rc = 99;
+  assert(!StopForSleep());
+  assert(sleep_deinit_calls == 0 && !secured);
+  reset();
+  sleep_deinit_rc = 99;
+  assert(!StopForSleep());
+  assert(sleep_stop_calls == 1 && sleep_deinit_calls == 1);
+  reset();
+  host_ready = false;
+  assert(!StopForSleep() && sleep_stop_calls == 0);
+}
 }  // namespace
 
 int main() {
@@ -483,5 +517,7 @@ int main() {
   registered_missing_bond_can_explicitly_repair();
   registered_missing_bond_store_failure_is_not_secured();
   cancel_termination_failure_is_visible();
-  puts("ble_keyboard: PASS (33 real-implementation regression cases)");
+  sleep_shutdown_preserves_bonds_and_stops_readvertising();
+  sleep_shutdown_failures_are_reported();
+  puts("ble_keyboard: PASS (35 real-implementation regression cases)");
 }
