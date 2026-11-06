@@ -19,6 +19,7 @@
 #include "input_router.h"
 #include "led_model.h"
 #include "touchpad_gestures.h"
+#include "swipe_shortcut.h"
 #include "ui_model.h"
 #include "ui_view.h"
 #include "nvs.h"
@@ -398,19 +399,11 @@ int8_t clamp_int8(int32_t value) {
 
 void route_touch_outputs(input_router::InputRouter& router,
                          const touchpad::MouseOutput* outputs, size_t count) {
-  // Two-finger swipes become browser history shortcuts: Cmd+[ / Cmd+]
-  // (HID usages for the US layout's bracket keys).
-  static constexpr uint8_t kLeftGui = 0x08;
-  static constexpr uint8_t kUsageLeftBracket = 0x2F;
-  static constexpr uint8_t kUsageRightBracket = 0x30;
   input_router::Actions actions;
   for (size_t i = 0; i < count; ++i) {
     if (outputs[i].swipe != touchpad::Swipe::kNone) {
-      router.OnShortcut(kLeftGui,
-                        outputs[i].swipe == touchpad::Swipe::kRight
-                            ? kUsageLeftBracket
-                            : kUsageRightBracket,
-                        actions);
+      const auto shortcut = swipe_shortcut::For(router.active_slot(), outputs[i].swipe);
+      router.OnShortcut(shortcut.modifiers, shortcut.key, actions);
       execute(router, actions);
       ESP_LOGI(kTag, "swipe %s",
                outputs[i].swipe == touchpad::Swipe::kRight ? "back" : "forward");
