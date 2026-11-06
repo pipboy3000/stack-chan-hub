@@ -88,6 +88,9 @@ class Gestures {
  public:
   explicit Gestures(const Config& config = Config{});
 
+  // Changes pointer scaling without carrying fractional movement between hosts.
+  void SetPointerDenominator(int32_t denominator);
+
   // Feeds one frame. Writes up to kMaxOutputs reports, returns the count.
   size_t OnFrame(const Frame& frame, MouseOutput* out);
 

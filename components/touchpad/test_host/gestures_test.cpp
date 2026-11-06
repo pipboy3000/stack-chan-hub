@@ -95,19 +95,64 @@ size_t lift(Gestures& gestures, uint32_t t, MouseOutput* out) {
   return gestures.OnFrame(frame(t, {}), out);
 }
 
+bool test_small_motion_still_taps_without_dragging() {
+  Gestures gestures;
+  MouseOutput out[kMaxOutputs];
+  CHECK(gestures.OnFrame(frame(1000, {{0, 500, 500}}), out) == 0);
+  CHECK(gestures.OnFrame(frame(1010, {{0, 508, 500}}), out) == 1);
+  CHECK(out[0].dx == 1 && out[0].buttons == 0);
+  CHECK(lift(gestures, 1050, out) == 1 && out[0].buttons == 1);
+  // A second touch before the drag window closes must remain a click until
+  // its own movement exceeds tap slop; the held button must not drag.
+  CHECK(gestures.OnFrame(frame(1100, {{0, 508, 500}}), out) == 0);
+  CHECK(gestures.OnFrame(frame(1110, {{0, 524, 500}}), out) == 0);
+  CHECK(lift(gestures, 1150, out) == 3);
+  CHECK(out[0].buttons == 0 && out[1].buttons == 1 && out[2].buttons == 0);
+  return true;
+}
+
+bool test_multifinger_transition_does_not_move_pointer() {
+  Gestures gestures;
+  MouseOutput out[kMaxOutputs];
+  CHECK(gestures.OnFrame(frame(1000, {{0, 500, 500}}), out) == 0);
+  CHECK(gestures.OnFrame(frame(1010, {{0, 500, 500}, {1, 900, 500}}), out) == 0);
+  CHECK(gestures.OnFrame(frame(1020, {{0, 500, 500}}), out) == 0);
+  CHECK(gestures.OnFrame(frame(1030, {{0, 516, 500}}), out) == 0);
+  CHECK(lift(gestures, 1050, out) == 2);
+  CHECK(out[0].buttons == 2 && out[1].buttons == 0);
+  return true;
+}
+
 bool test_one_finger_moves_pointer() {
   Gestures gestures;
   uint32_t t = 1000;
   const Totals totals = slide(gestures, t, {{0, 500, 500}}, 800, -400, 40);
-  // Default gain is 1/8; the first slop's worth is not pointer motion.
-  CHECK(totals.dx > 80 && totals.dx <= 100);
-  CHECK(totals.dy < -35 && totals.dy >= -50);
+  // Default gain is 1/8, including movement within the tap slop.
+  CHECK(totals.dx == 100);
+  CHECK(totals.dy == -50);
   CHECK(totals.wheel == 0);
   CHECK(totals.last_buttons == 0);
   MouseOutput out[kMaxOutputs];
   // A moved touch is not a tap.
   CHECK(lift(gestures, t + 1, out) == 0);
   CHECK(gestures.OnTick(t + 500, out) == 0);
+  return true;
+}
+
+bool test_pointer_gain_and_switch() {
+  Gestures gestures;
+  MouseOutput out[kMaxOutputs];
+  CHECK(gestures.OnFrame(frame(1000, {{0, 100, 100}}), out) == 0);
+  CHECK(gestures.OnFrame(frame(1010, {{0, 103, 100}}), out) == 0);
+  gestures.SetPointerDenominator(4);
+  CHECK(gestures.OnFrame(frame(1020, {{0, 104, 100}}), out) == 0);
+  CHECK(gestures.OnFrame(frame(1030, {{0, 107, 100}}), out) == 1);
+  CHECK(out[0].dx == 1);
+  CHECK(gestures.OnFrame(frame(1040, {{0, 907, 100}}), out) == 1);
+  CHECK(out[0].dx == 200);  // not clipped to a BLE report's 127 limit
+  gestures.SetPointerDenominator(8);
+  CHECK(gestures.OnFrame(frame(1050, {{0, 107, 100}}), out) == 1);
+  CHECK(out[0].dx == -100);
   return true;
 }
 
@@ -855,6 +900,9 @@ void run_test(const char* name, bool (*test)()) {
 }  // namespace
 
 int main() {
+  run_test("pointer_gain_and_switch", test_pointer_gain_and_switch);
+  run_test("small_motion_still_taps_without_dragging", test_small_motion_still_taps_without_dragging);
+  run_test("multifinger_transition_does_not_move_pointer", test_multifinger_transition_does_not_move_pointer);
   run_test("one_finger_moves_pointer", test_one_finger_moves_pointer);
   run_test("tap_clicks_after_drag_window", test_tap_clicks_after_drag_window);
   run_test("long_press_is_not_a_tap", test_long_press_is_not_a_tap);

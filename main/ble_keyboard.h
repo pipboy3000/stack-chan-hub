@@ -94,6 +94,16 @@ bool SendSystem(uint16_t usage);
 // Relative mouse: buttons bit 0 = left; x, y, wheel and pan in -127..127.
 bool SendMouse(uint8_t buttons, int8_t x, int8_t y, int8_t wheel, int8_t pan);
 
+// Current BLE connection parameters. Zero interval means disconnected or unknown.
+// Interval units are 1.25 ms; latency is the permitted skipped-event count.
+struct LinkTiming { uint16_t interval; uint16_t latency; };
+LinkTiming CurrentLinkTiming();
+// -1 means not requested / no update event on the current connection.
+int IntervalRequestResult();
+int IntervalUpdateStatus();
+uint8_t IntervalRetryCount();
+bool IntervalRetryPending();
+
 // Input reports handed to the stack / rejected by it, for diagnostics.
 uint32_t SentCount();
 uint32_t FailedCount();

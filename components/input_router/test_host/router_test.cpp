@@ -381,6 +381,11 @@ bool test_consumer_system_mouse_forwarded_when_connected() {
   CHECK(actions.items[0].mouse.buttons == 1);
   CHECK(actions.items[0].mouse.x == -5);
   CHECK(actions.items[0].mouse.y == 7);
+  mouse.x = 300;
+  mouse.y = -300;
+  router.OnUsbMouseReport(mouse, actions);
+  CHECK(actions.count == 1);
+  CHECK(actions.items[0].mouse.x == 300 && actions.items[0].mouse.y == -300);
   return true;
 }
 

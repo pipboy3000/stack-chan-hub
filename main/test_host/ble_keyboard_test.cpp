@@ -30,6 +30,7 @@ void reset() {
   request_head = request_count = 0;
   for (auto& error : slot_errors) error = ManagementError::kNone;
   ble_npl_callout_init(&pairing_timer, nimble_port_get_dflt_eventq(), pairing_expired, nullptr);
+  ble_npl_callout_init(&interval_retry_timer, nimble_port_get_dflt_eventq(), retry_short_interval, nullptr);
   notifications.clear();
   peer_slots = PeerSlots{};
   assert(peer_slots.Bind(0, kPeer0));
@@ -37,6 +38,12 @@ void reset() {
   secured = false;
   disconnect_pending = false;
   conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  link_timing = 0;
+  interval_request_rc = interval_update_status = -1;
+  interval_retry_count = 0;
+  interval_retry_pending = false;
+  interval_request_inflight = false;
+  interval_retry_deadline = 0;
   active_slot = link_slot = advertised_slot = 0;
   host_ready = true;
   migrate_legacy_bonds = false;
@@ -67,6 +74,218 @@ void connected0() {
   connect();
   assert(secured && conn_handle == kHandle && count(LinkEvent::kSecured) == 1);
   notifications.clear();
+}
+
+void interval_resecure_preserves_inflight_request_and_collision_retry() {
+  reset();
+  active_slot = link_slot = advertised_slot = 1;
+  fake_sdk::connection.peer_id_addr = ble_address(kPeer1);
+  connect();
+  assert(secured && interval_request_inflight && fake_sdk::update_calls == 1);
+  // Re-security before the update event must not replace our in-flight
+  // request with EALREADY, or discard its eventual collision notification.
+  secured = false;
+  fake_sdk::update_rc = BLE_HS_EALREADY;
+  secure_link(kHandle);
+  assert(secured && fake_sdk::update_calls == 1);
+  assert(IntervalRequestResult() == 0 && interval_request_inflight);
+  ble_gap_event update{};
+  update.type = BLE_GAP_EVENT_CONN_UPDATE;
+  update.conn_update.conn_handle = kHandle;
+  update.conn_update.status = BLE_HS_HCI_ERR(BLE_ERR_LMP_COLLISION);
+  on_gap_event(&update, nullptr);
+  assert(IntervalRetryPending() && !interval_request_inflight);
+  // Another collision or re-security while waiting must preserve the timer.
+  update.conn_update.status = BLE_HS_HCI_ERR(BLE_ERR_DIFF_TRANS_COLL);
+  on_gap_event(&update, nullptr);
+  secured = false;
+  secure_link(kHandle);
+  assert(secured && IntervalRetryPending() && fake_sdk::update_calls == 1);
+  fake_sdk::update_rc = 0;
+  fake_sdk::now += kIntervalRetryDelayMs;
+  retry_short_interval(nullptr);
+  assert(!IntervalRetryPending() && IntervalRetryCount() == 1);
+  assert(fake_sdk::update_calls == 2 && interval_request_inflight);
+  update.conn_update.status = 0;
+  fake_sdk::connection.conn_itvl = 12;
+  on_gap_event(&update, nullptr);
+  assert(CurrentLinkTiming().interval == 12 && !interval_request_inflight);
+}
+
+void external_ealready_is_not_treated_as_inflight() {
+  reset();
+  active_slot = link_slot = advertised_slot = 1;
+  fake_sdk::connection.peer_id_addr = ble_address(kPeer1);
+  fake_sdk::update_rc = BLE_HS_EALREADY;
+  connect();
+  assert(IntervalRequestResult() == BLE_HS_EALREADY && !interval_request_inflight);
+  ble_gap_event update{};
+  update.type = BLE_GAP_EVENT_CONN_UPDATE;
+  update.conn_update.conn_handle = kHandle;
+  update.conn_update.status = BLE_HS_HCI_ERR(BLE_ERR_LMP_COLLISION);
+  on_gap_event(&update, nullptr);
+  assert(!IntervalRetryPending() && fake_sdk::update_calls == 1);
+}
+
+void interval_collision_retries_are_bounded_and_safe() {
+  reset();
+  active_slot = link_slot = advertised_slot = 1;
+  fake_sdk::connection.peer_id_addr = ble_address(kPeer1);
+  connect();
+  assert(secured && fake_sdk::update_calls == 1);
+  ble_gap_event update{};
+  update.type = BLE_GAP_EVENT_CONN_UPDATE;
+  update.conn_update.conn_handle = kHandle;
+  update.conn_update.status = BLE_HS_HCI_ERR(BLE_ERR_DIFF_TRANS_COLL);
+  for (int retry = 1; retry <= 3; ++retry) {
+    on_gap_event(&update, nullptr);
+    assert(IntervalRetryPending());
+    retry_short_interval(nullptr);  // A stale callback before the deadline is ignored.
+    assert(fake_sdk::update_calls == retry);
+    fake_sdk::now += kIntervalRetryDelayMs;
+    retry_short_interval(nullptr);
+    assert(!IntervalRetryPending() && IntervalRetryCount() == retry);
+    assert(fake_sdk::update_calls == retry + 1);
+  }
+  on_gap_event(&update, nullptr);
+  assert(!IntervalRetryPending() && fake_sdk::update_calls == 4);
+  disconnect();
+  assert(IntervalRetryCount() == 0 && !IntervalRetryPending());
+  fake_sdk::now += kIntervalRetryDelayMs;
+  retry_short_interval(nullptr);
+  assert(fake_sdk::update_calls == 4);
+  connect();  // A reused handle must not let an old callback bypass a new delay.
+  on_gap_event(&update, nullptr);
+  assert(IntervalRetryPending() && fake_sdk::update_calls == 5);
+  retry_short_interval(nullptr);
+  assert(IntervalRetryPending() && fake_sdk::update_calls == 5);
+  fake_sdk::now += kIntervalRetryDelayMs;
+  retry_short_interval(nullptr);
+  assert(IntervalRetryCount() == 1 && fake_sdk::update_calls == 6);
+}
+
+void interval_retry_stops_for_slot_switch_and_other_results() {
+  reset();
+  active_slot = link_slot = advertised_slot = 1;
+  fake_sdk::connection.peer_id_addr = ble_address(kPeer1);
+  connect();
+  ble_gap_event update{};
+  update.type = BLE_GAP_EVENT_CONN_UPDATE;
+  update.conn_update.conn_handle = kHandle;
+  update.conn_update.status = BLE_HS_HCI_ERR(BLE_ERR_DIFF_TRANS_COLL);
+  on_gap_event(&update, nullptr);
+  assert(IntervalRetryPending());
+  active_slot = 0;  // selection occurs before its queued handler
+  fake_sdk::now += kIntervalRetryDelayMs;
+  retry_short_interval(nullptr);
+  assert(fake_sdk::update_calls == 1 && !IntervalRetryPending());
+  disconnect();
+
+  active_slot = link_slot = advertised_slot = 1;
+  connect();
+  on_gap_event(&update, nullptr);
+  assert(IntervalRetryPending());
+  update.conn_update.status = 0;
+  on_gap_event(&update, nullptr);
+  assert(!IntervalRetryPending());
+  fake_sdk::now += kIntervalRetryDelayMs;
+  retry_short_interval(nullptr);
+  assert(fake_sdk::update_calls == 2);
+  disconnect();
+
+  connect();
+  update.conn_update.status = 7;
+  on_gap_event(&update, nullptr);
+  assert(!IntervalRetryPending() && IntervalUpdateStatus() == 7);
+  retry_short_interval(nullptr);
+  assert(fake_sdk::update_calls == 3);
+  disconnect();
+
+  connect();
+  update.conn_update.status = BLE_HS_HCI_ERR(BLE_ERR_DIFF_TRANS_COLL);
+  on_gap_event(&update, nullptr);
+  fake_sdk::update_rc = 3;  // Failed retry must not queue another attempt.
+  fake_sdk::now += kIntervalRetryDelayMs;
+  retry_short_interval(nullptr);
+  assert(IntervalRequestResult() == 3 && IntervalRetryCount() == 1);
+  on_gap_event(&update, nullptr);
+  assert(!IntervalRetryPending() && fake_sdk::update_calls == 5);
+}
+
+void linux_interval_request_tracks_security_and_results() {
+  reset();
+  active_slot = link_slot = advertised_slot = 1;
+  fake_sdk::connection.peer_id_addr = ble_address(kPeer1);
+  fake_sdk::connection.sec_state = {0, 0};
+  connect();
+  assert(fake_sdk::update_calls == 0 && IntervalRequestResult() == -1);
+  fake_sdk::connection.sec_state = {1, 1};
+  ble_gap_event encrypted{};
+  encrypted.type = BLE_GAP_EVENT_ENC_CHANGE;
+  encrypted.enc_change.conn_handle = kHandle;
+  on_gap_event(&encrypted, nullptr);
+  assert(fake_sdk::update_calls == 1 && fake_sdk::update_handle == kHandle);
+  const auto p = fake_sdk::update_params;
+  assert(p.itvl_min == 9 && p.itvl_max == 12 && p.latency == 0);
+  assert(p.supervision_timeout == 300 && p.min_ce_len == 0 && p.max_ce_len == 0);
+  assert(IntervalRequestResult() == 0 && IntervalUpdateStatus() == -1);
+  secure_link(kHandle);
+  assert(fake_sdk::update_calls == 1);  // encryption callbacks may repeat
+  ble_gap_event update{};
+  update.type = BLE_GAP_EVENT_CONN_UPDATE;
+  update.conn_update.conn_handle = kHandle;
+  update.conn_update.status = 7;
+  on_gap_event(&update, nullptr);
+  assert(secured && IntervalUpdateStatus() == 7);
+  fake_sdk::connection.conn_itvl = 12;
+  fake_sdk::connection.conn_latency = 0;
+  update.conn_update.status = 0;
+  on_gap_event(&update, nullptr);
+  assert(CurrentLinkTiming().interval == 12 && IntervalUpdateStatus() == 0);
+  disconnect();
+  assert(IntervalRequestResult() == -1 && IntervalUpdateStatus() == -1);
+  fake_sdk::update_rc = 3;
+  connect();
+  assert(secured && fake_sdk::update_calls == 2 && IntervalRequestResult() == 3);
+}
+
+void mac_never_requests_linux_interval() {
+  connected0();
+  assert(fake_sdk::update_calls == 0 && IntervalRequestResult() == -1);
+  secure_link(kHandle);
+  assert(fake_sdk::update_calls == 0);
+  disconnect();
+  const PeerAddress macbook{0, {3, 4, 5, 6, 7, 8}};
+  assert(peer_slots.Bind(2, macbook));
+  active_slot = link_slot = advertised_slot = 2;
+  fake_sdk::connection.peer_id_addr = ble_address(macbook);
+  connect();
+  assert(secured && fake_sdk::update_calls == 0);
+}
+
+void timing_tracks_admitted_connection_updates_and_disconnect() {
+  reset();
+  fake_sdk::connection.conn_itvl = 12;
+  fake_sdk::connection.conn_latency = 3;
+  connect();
+  assert(CurrentLinkTiming().interval == 12 && CurrentLinkTiming().latency == 3);
+  ble_gap_event update{};
+  update.type = BLE_GAP_EVENT_CONN_UPDATE;
+  update.conn_update.conn_handle = kHandle;
+  fake_sdk::connection.conn_itvl = 24;
+  fake_sdk::connection.conn_latency = 1;
+  update.conn_update.status = 1;  // Failed changes retain the old timing.
+  on_gap_event(&update, nullptr);
+  assert(CurrentLinkTiming().interval == 12);
+  update.conn_update.status = 0;
+  update.conn_update.conn_handle = kHandle + 1;  // Unrelated handle.
+  on_gap_event(&update, nullptr);
+  assert(CurrentLinkTiming().interval == 12);
+  update.conn_update.conn_handle = kHandle;
+  on_gap_event(&update, nullptr);
+  assert(CurrentLinkTiming().interval == 24 && CurrentLinkTiming().latency == 1);
+  disconnect();
+  assert(CurrentLinkTiming().interval == 0 && CurrentLinkTiming().latency == 0);
 }
 
 void selection_round_trip_waits_for_disconnect() {
@@ -484,6 +703,13 @@ void sleep_shutdown_failures_are_reported() {
 }  // namespace
 
 int main() {
+  interval_resecure_preserves_inflight_request_and_collision_retry();
+  external_ealready_is_not_treated_as_inflight();
+  interval_collision_retries_are_bounded_and_safe();
+  interval_retry_stops_for_slot_switch_and_other_results();
+  linux_interval_request_tracks_security_and_results();
+  mac_never_requests_linux_interval();
+  timing_tracks_admitted_connection_updates_and_disconnect();
   selection_round_trip_waits_for_disconnect();
   already_terminating_is_pending();
   reconnect_uses_latest_slot_and_identity();

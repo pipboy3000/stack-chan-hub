@@ -28,8 +28,8 @@ struct KeyboardReport {
 // Relative mouse report. Buttons are bit 0 = left, 1 = right, 2 = middle...
 struct MouseReport {
   uint8_t buttons = 0;
-  int8_t x = 0;
-  int8_t y = 0;
+  int16_t x = 0;
+  int16_t y = 0;
   int8_t wheel = 0;
   int8_t pan = 0;
 };

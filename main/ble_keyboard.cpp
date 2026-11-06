@@ -147,6 +147,18 @@ esp_hidd_dev_t* hid_device = nullptr;
 LinkCallback link_callback = nullptr;
 std::atomic<bool> secured{false};
 std::atomic<uint16_t> conn_handle{BLE_HS_CONN_HANDLE_NONE};
+// One atomic snapshot prevents interval and latency from different updates.
+std::atomic<uint32_t> link_timing{0};
+// -1 means no request/result on the current connection.
+std::atomic<int> interval_request_rc{-1};
+std::atomic<int> interval_update_status{-1};
+std::atomic<uint8_t> interval_retry_count{0};
+std::atomic<bool> interval_retry_pending{false};
+constexpr uint8_t kIntervalRetryLimit = 3;
+constexpr uint32_t kIntervalRetryDelayMs = 500;
+ble_npl_callout interval_retry_timer{};
+uint32_t interval_retry_deadline = 0;
+bool interval_request_inflight = false;
 std::atomic<bool> disconnect_pending{false};
 
 // Plan B: one public identity, independent bonds for three selected peers.
@@ -389,6 +401,13 @@ void complete_disconnect() {
   const uint8_t slot = link_slot;
   secured = false;
   conn_handle = BLE_HS_CONN_HANDLE_NONE;
+  link_timing = 0;
+  interval_request_rc = -1;
+  interval_update_status = -1;
+  interval_retry_count = 0;
+  interval_retry_pending = false;
+  interval_request_inflight = false;
+  ble_npl_callout_stop(&interval_retry_timer);
   disconnect_pending = false;
   pairing_link = false;
   notify(LinkEvent::kDisconnected, slot);
@@ -597,6 +616,46 @@ bool admit_link(uint16_t handle, const ble_gap_conn_desc& desc) {
   return true;
 }
 
+void request_short_interval(uint16_t handle) {
+  if (interval_request_inflight || interval_retry_pending) return;
+  ble_gap_upd_params params{};
+  params.itvl_min = 9;  // 11.25 ms
+  params.itvl_max = 12; // 15 ms
+  params.latency = 0;
+  params.supervision_timeout = 300; // 3 s
+  const int rc = ble_gap_update_params(handle, &params);
+  interval_request_rc = rc;
+  interval_request_inflight = rc == 0;
+  if (rc != 0) ESP_LOGW(kTag, "connection interval request rc=%d", rc);
+}
+
+void retry_short_interval(ble_npl_event*) {
+  if (!interval_retry_pending ||
+      static_cast<int32_t>(ble_npl_time_get() - interval_retry_deadline) < 0) return;
+  interval_retry_pending = false;
+  if (!host_ready || !secured || disconnect_pending ||
+      conn_handle == BLE_HS_CONN_HANDLE_NONE || active_slot != 1 || link_slot != 1) return;
+  ++interval_retry_count;
+  request_short_interval(conn_handle);
+}
+
+bool is_interval_collision(int status) {
+  return status == BLE_HS_HCI_ERR(BLE_ERR_DIFF_TRANS_COLL) ||
+         status == BLE_HS_HCI_ERR(BLE_ERR_LMP_COLLISION);
+}
+
+void schedule_interval_retry() {
+  if (interval_retry_pending || interval_retry_count >= kIntervalRetryLimit) return;
+  const uint32_t delay = ble_npl_time_ms_to_ticks32(kIntervalRetryDelayMs);
+  interval_retry_deadline = ble_npl_time_get() + delay;
+  interval_retry_pending = true;
+  const int rc = ble_npl_callout_reset(&interval_retry_timer, delay);
+  if (rc != 0) {
+    interval_retry_pending = false;
+    ESP_LOGW(kTag, "connection interval retry timer rc=%d", rc);
+  }
+}
+
 void secure_link(uint16_t handle) {
   if (disconnect_pending) return;
   ble_gap_conn_desc desc{};
@@ -631,7 +690,14 @@ void secure_link(uint16_t handle) {
     pairing_link = false;
     close_pairing(LinkEvent::kPairingComplete);
   }
-  if (!secured.exchange(true)) notify(LinkEvent::kSecured, slot);
+  if (!secured.exchange(true)) {
+    // Linux is slot 2. Request a shorter connection interval after security;
+    // the central may choose different parameters or reject the request.
+    if (slot == 1) {
+      request_short_interval(handle);
+    }
+    notify(LinkEvent::kSecured, slot);
+  }
 }
 
 int on_gap_event(ble_gap_event* event, void*) {
@@ -649,6 +715,8 @@ int on_gap_event(ble_gap_event* event, void*) {
         if (!admit_link(event->connect.conn_handle, desc) || disconnect_pending) {
           return 0;
         }
+        link_timing = (static_cast<uint32_t>(desc.conn_latency) << 16) |
+                      desc.conn_itvl;
         // Encryption can finish before IDF's delayed CONNECT callback.
         secure_link(event->connect.conn_handle);
         // macOS's Bluetooth UI may only connect/discover services until the
@@ -662,6 +730,31 @@ int on_gap_event(ble_gap_event* event, void*) {
         }
       }
       return 0;
+
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+      if (event->conn_update.conn_handle != conn_handle) return 0;
+      interval_update_status = event->conn_update.status;
+      if (!is_interval_collision(event->conn_update.status) &&
+          interval_retry_pending) {
+        interval_retry_pending = false;
+        ble_npl_callout_stop(&interval_retry_timer);
+      }
+      const bool was_requested = interval_request_inflight;
+      interval_request_inflight = false;
+      if (was_requested && is_interval_collision(event->conn_update.status) &&
+          secured && !disconnect_pending && active_slot == 1 && link_slot == 1) {
+        schedule_interval_retry();
+      }
+      if (event->conn_update.status == 0 &&
+          ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+        link_timing = (static_cast<uint32_t>(desc.conn_latency) << 16) |
+                      desc.conn_itvl;
+      } else if (event->conn_update.status != 0) {
+        ESP_LOGW(kTag, "connection interval update status=%d",
+                 event->conn_update.status);
+      }
+      return 0;
+    }
 
     case BLE_GAP_EVENT_DISCONNECT: {
       ESP_LOGI(kTag, "disconnect reason=0x%x", event->disconnect.reason);
@@ -760,6 +853,8 @@ bool Start(const char* device_name, uint8_t slot, LinkCallback callback) {
   ble_npl_event_init(&management_event, apply_management, nullptr);
   if (ble_npl_callout_init(&pairing_timer, nimble_port_get_dflt_eventq(),
                            pairing_expired, nullptr) != 0) return false;
+  if (ble_npl_callout_init(&interval_retry_timer, nimble_port_get_dflt_eventq(),
+                           retry_short_interval, nullptr) != 0) return false;
   publish_slots();
   ble_svc_gap_device_appearance_set(ESP_HID_APPEARANCE_KEYBOARD);
 
@@ -817,6 +912,8 @@ bool StopForSleep() {
   // Require the GAP disconnect callback before declaring a graceful stop.
   if (conn_handle != BLE_HS_CONN_HANDLE_NONE) return false;
   ble_npl_callout_stop(&pairing_timer);
+  ble_npl_callout_stop(&interval_retry_timer);
+  interval_retry_pending = false;
   return nimble_port_deinit() == ESP_OK;
 }
 
@@ -852,6 +949,16 @@ bool send(uint8_t report_id, uint8_t* report, size_t length) {
 }
 
 }  // namespace
+
+LinkTiming CurrentLinkTiming() {
+  const uint32_t timing = link_timing.load();
+  return {static_cast<uint16_t>(timing), static_cast<uint16_t>(timing >> 16)};
+}
+
+int IntervalRequestResult() { return interval_request_rc.load(); }
+int IntervalUpdateStatus() { return interval_update_status.load(); }
+uint8_t IntervalRetryCount() { return interval_retry_count.load(); }
+bool IntervalRetryPending() { return interval_retry_pending.load(); }
 
 uint32_t SentCount() { return sent_count; }
 uint32_t FailedCount() { return failed_count; }

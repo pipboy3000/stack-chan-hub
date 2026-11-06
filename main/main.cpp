@@ -18,6 +18,7 @@
 #include "hid_descriptor.h"
 #include "input_router.h"
 #include "led_model.h"
+#include "motion_diagnostics.h"
 #include "touchpad_gestures.h"
 #include "swipe_shortcut.h"
 #include "ui_model.h"
@@ -121,6 +122,7 @@ UsbInterface* usb_interfaces = nullptr;
 QueueHandle_t ui_messages;
 QueueHandle_t device_events;
 QueueHandle_t router_events;
+MotionDiagnostics motion_diagnostics;
 std::atomic<uint32_t> dropped_reports{0};
 std::atomic<uint32_t> ble_send_failures{0};
 // Liveness counters shown on the LCD: USB host mode has no serial log.
@@ -283,6 +285,7 @@ bool outbox_pump() {
         const int8_t wheel = take_step(step.wheel);
         const int8_t pan = take_step(step.pan);
         sent = ble_keyboard::SendMouse(head.buttons, x, y, wheel, pan);
+        ++(sent ? motion_diagnostics.mouse_sent : motion_diagnostics.mouse_retry);
         if (sent && (step.x || step.y || step.wheel || step.pan)) {
           head = step;  // the rest of the motion stays queued
           continue;
@@ -411,10 +414,11 @@ void route_touch_outputs(input_router::InputRouter& router,
               outputs[i].swipe == touchpad::Swipe::kRight ? "back" : "forward");
       continue;
     }
+    motion_diagnostics.OnOutput(outputs[i]);
     input_router::MouseReport report;
     report.buttons = outputs[i].buttons;
-    report.x = clamp_int8(outputs[i].dx);
-    report.y = clamp_int8(outputs[i].dy);
+    report.x = outputs[i].dx;
+    report.y = outputs[i].dy;
     report.wheel = clamp_int8(outputs[i].wheel);
     report.pan = clamp_int8(outputs[i].pan);
     router.OnUsbMouseReport(report, actions);
@@ -526,12 +530,16 @@ void router_task(void*) {
           }
         }
         event.touch.time_ms = now_ms();
+        motion_diagnostics.OnFrame(event.touch);
         log_touch_frame(event.touch);
+        // Slot 2 is Linux; keep both Mac slots at the original scaling.
+        gestures.SetPointerDenominator(router.active_slot() == 1 ? 4 : 8);
         route_touch_outputs(router, touch_outputs,
                             gestures.OnFrame(event.touch, touch_outputs));
         actions.count = 0;
         break;
       case RouterEventKind::kUsbDisconnected:
+        motion_diagnostics.ResetContact();
         gestures.Reset(touch_outputs);  // the router releases everything
         router.OnUsbDisconnected(actions);
         break;
@@ -1412,13 +1420,16 @@ int write_status(char* out, int size) {
   const bool host_installed = usb_host_lib_info(&usb_info) == ESP_OK;
   // Read-only controller snapshot for this ESP32-S3 diagnostic build.
   const uint32_t port = host_installed ? USB_DWC.hprt_reg.val : 0;
+  const auto timing = ble_keyboard::CurrentLinkTiming();
   return snprintf(out, size,
                   "usb %lu\nrouter %lu\nble sent %lu failed %lu\nui %lu\n"
-                  "dropped %lu\nsecured %d\ninternal free %lu largest dma %lu\n"
+                  "dropped %lu\nsecured %d\nble interval_1.25ms %u latency %u request_rc %d update_status %d retries %u retry_pending %d\ninternal free %lu largest dma %lu\n"
                   "reset %s\nbattery %.2fV %.0fmA\n"
                   "vbus_mV %d pmic_status %d\notg %d boost %d aw_outputs %d\n"
                   "charge_diag_mA 200 charge_reg62 %d\n"
-                  "usb_devices %d clients %d hprt %08lx\n",
+                  "usb_devices %d clients %d hprt %08lx\n"
+                  "motion frames %lu gaps_ms 0:%lu 1-5:%lu 6-10:%lu 11-20:%lu 21-150:%lu\n"
+                  "motion reports %lu distance %lu mouse_sent %lu mouse_retry %lu outbox_lost %lu\n",
                   static_cast<unsigned long>(usb_input_count.load()),
                   static_cast<unsigned long>(router_loop_count.load()),
                   static_cast<unsigned long>(ble_keyboard::SentCount()),
@@ -1426,6 +1437,12 @@ int write_status(char* out, int size) {
                   static_cast<unsigned long>(ui_loop_count.load()),
                   static_cast<unsigned long>(dropped_reports.load()),
                   ble_secured.load() ? 1 : 0,
+                  static_cast<unsigned>(timing.interval),
+                  static_cast<unsigned>(timing.latency),
+                  ble_keyboard::IntervalRequestResult(),
+                  ble_keyboard::IntervalUpdateStatus(),
+                  static_cast<unsigned>(ble_keyboard::IntervalRetryCount()),
+                  ble_keyboard::IntervalRetryPending() ? 1 : 0,
                   static_cast<unsigned long>(
                       heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
                   static_cast<unsigned long>(heap_caps_get_largest_free_block(
@@ -1440,7 +1457,18 @@ int write_status(char* out, int size) {
                   aw_output_registers.load(), charge_current_register.load(),
                   host_installed ? usb_info.num_devices : -1,
                   host_installed ? usb_info.num_clients : -1,
-                  static_cast<unsigned long>(port));
+                  static_cast<unsigned long>(port),
+                  static_cast<unsigned long>(motion_diagnostics.frames.load()),
+                  static_cast<unsigned long>(motion_diagnostics.gap_zero.load()),
+                  static_cast<unsigned long>(motion_diagnostics.gap_5.load()),
+                  static_cast<unsigned long>(motion_diagnostics.gap_10.load()),
+                  static_cast<unsigned long>(motion_diagnostics.gap_20.load()),
+                  static_cast<unsigned long>(motion_diagnostics.gap_long.load()),
+                  static_cast<unsigned long>(motion_diagnostics.moves.load()),
+                  static_cast<unsigned long>(motion_diagnostics.distance.load()),
+                  static_cast<unsigned long>(motion_diagnostics.mouse_sent.load()),
+                  static_cast<unsigned long>(motion_diagnostics.mouse_retry.load()),
+                  static_cast<unsigned long>(ble_send_failures.load()));
 }
 
 extern "C" void app_main() {

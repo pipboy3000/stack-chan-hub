@@ -183,7 +183,7 @@ esp_err_t handle_ota(httpd_req_t* request) {
 esp_err_t handle_status(httpd_req_t* request) {
   const esp_partition_t* running = esp_ota_get_running_partition();
   const esp_app_desc_t* app = esp_app_get_description();
-  char body[512];
+  char body[1024];
   int length = snprintf(
       body, sizeof(body), "partition %s\nbuilt %s %s\nfree heap %lu\n",
       running->label, app->date, app->time,

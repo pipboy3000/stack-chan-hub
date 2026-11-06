@@ -69,16 +69,24 @@ struct ble_gap_adv_params {
   uint8_t conn_mode, disc_mode, filter_policy;
   uint16_t itvl_min, itvl_max;
 };
+#define BLE_ERR_DIFF_TRANS_COLL 0x2a
+#define BLE_ERR_LMP_COLLISION 0x23
+#define BLE_HS_HCI_ERR(x) ((x) ? 0x200 + (x) : 0)
+struct ble_gap_upd_params {
+  uint16_t itvl_min, itvl_max, latency, supervision_timeout, min_ce_len, max_ce_len;
+};
 struct ble_gap_conn_desc {
   ble_addr_t peer_id_addr, peer_ota_addr;
+  uint16_t conn_itvl, conn_latency;
   struct { uint8_t encrypted, bonded; } sec_state;
 };
 enum { BLE_GAP_EVENT_CONNECT, BLE_GAP_EVENT_DISCONNECT,
        BLE_GAP_EVENT_ENC_CHANGE, BLE_GAP_EVENT_REPEAT_PAIRING,
-       BLE_GAP_EVENT_ADV_COMPLETE };
+       BLE_GAP_EVENT_ADV_COMPLETE, BLE_GAP_EVENT_CONN_UPDATE };
 struct ble_gap_event {
   uint8_t type;
   struct { int status; uint16_t conn_handle; } connect;
+  struct { int status; uint16_t conn_handle; } conn_update;
   struct { int reason; } disconnect;
   struct { int status; uint16_t conn_handle; } enc_change;
   struct { uint16_t conn_handle; } repeat_pairing;
@@ -103,7 +111,9 @@ struct ble_npl_eventq {};
 struct ble_npl_callout { ble_npl_event event; bool armed; uint32_t deadline; };
 
 namespace fake_sdk {
-inline int terminate_rc, adv_stop_rc, adv_start_rc;
+inline int terminate_rc, adv_stop_rc, adv_start_rc, update_rc, update_calls;
+inline uint16_t update_handle;
+inline ble_gap_upd_params update_params{};
 inline int delete_rc, nvs_set_rc, nvs_commit_rc, bond_read_rc, store_calls;
 inline uint32_t now;
 inline ble_addr_t deleted_peer{};
@@ -119,7 +129,8 @@ inline void log(bool error, const char*, const char*, ...) {
   if (error) ++error_logs;
 }
 inline void reset() {
-  terminate_rc = adv_stop_rc = adv_start_rc = 0;
+  terminate_rc = adv_stop_rc = adv_start_rc = update_rc = update_calls = 0;
+  update_handle = 0; update_params = {};
   delete_rc = nvs_set_rc = nvs_commit_rc = bond_read_rc = store_calls = 0;
   now = 0;
   terminate_calls = adv_stop_calls = whitelist_calls = adv_fields_calls = 0;
@@ -159,6 +170,12 @@ inline int ble_gap_terminate(uint16_t handle, uint8_t reason) {
 }
 inline int ble_gap_conn_find(uint16_t, ble_gap_conn_desc* desc) {
   *desc = fake_sdk::connection; return 0;
+}
+inline int ble_gap_update_params(uint16_t handle, const ble_gap_upd_params* params) {
+  ++fake_sdk::update_calls;
+  fake_sdk::update_handle = handle;
+  fake_sdk::update_params = *params;
+  return fake_sdk::update_rc;
 }
 inline int ble_gap_security_initiate(uint16_t) { ++fake_sdk::security_calls; return 0; }
 inline int ble_store_util_bonded_peers(ble_addr_t*, int* count, int) { *count = 0; return 0; }

@@ -20,6 +20,12 @@ bool reached(uint32_t now, uint32_t when) {
 
 Gestures::Gestures(const Config& config) : config_(config) {}
 
+void Gestures::SetPointerDenominator(int32_t denominator) {
+  if (denominator <= 0 || denominator == config_.pointer_den) return;
+  config_.pointer_den = denominator;
+  rem_x_ = rem_y_ = 0;
+}
+
 uint8_t Gestures::Buttons() const {
   return pad_buttons_ | (tap_button_ ? kLeft : 0);
 }
@@ -280,9 +286,13 @@ size_t Gestures::OnFrame(const Frame& frame, MouseOutput* out) {
       drag_tap_ = false;
     }
 
-    const bool pointing = touching_count == 1 && (phase_ == Phase::kMoving ||
-                                                  (phase_ == Phase::kDragging &&
-                                                   !drag_tap_));
+    // A possible one-finger tap may move the cursor before it exceeds tap
+    // slop. Keep a pending tap-drag stationary until it becomes a drag, and
+    // avoid pointer movement during a possible multi-finger tap.
+    const bool pointing = touching_count == 1 &&
+        (phase_ == Phase::kMoving ||
+         (phase_ == Phase::kTouch && max_fingers_ == 1) ||
+         (phase_ == Phase::kDragging && !drag_tap_));
     if (pointing) {
       const int16_t mx =
           Scale(rem_x_, dx, config_.pointer_num, config_.pointer_den);

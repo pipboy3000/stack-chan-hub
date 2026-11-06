@@ -58,6 +58,16 @@ sh tools/tap.sh 160 100
 
 - `log.sh`：UDP 5140のログを受信。Ctrl+Cで終了する。
 - `/status`：稼働区画・ビルド日時・空きメモリ・USB/Router/BLEのカウンタ・電源状態。
+  `ble interval_1.25ms` は現在接続の通信間隔（1.25 ms単位、0は不明・未接続）、
+  `latency` は許容される接続イベントのスキップ回数です。
+  Linux接続の `request_rc` は間隔変更要求の即時結果、`update_status` は
+  接続パラメータ更新イベントの結果です（0は成功、-1は未実行・未受信）。
+  `retries` は衝突時に実行した再要求回数（最大3回）、`retry_pending` は再要求待ちです。
+  `motion` は累積診断値です。単指フレームと、その router task 処理時刻の間隔を
+  0 / 1–5 / 6–10 / 11–20 / 21–150 ms に集計し、接触の切替や150 ms超は間隔から除外します。
+  `reports` と `distance` は変換後の非ゼロ移動数と相対移動量の絶対値合計、
+  `mouse_sent` / `mouse_retry` は全マウス送信の成功と再試行、`outbox_lost` はキュー溢れです。
+  操作前後の差を比較します。USB到着時刻やホストの描画間隔ではありません。
 - `screenshot.sh`：LCDキャンバスをPNGへ保存。Python3とmacOSの `sips` を使用する。
 - `tap.sh`：実機への遠隔タップ。`.ota-token` が必要で、PCの切替等も実行される。
 
@@ -68,6 +78,8 @@ IP指定やプロキシ設定は[セットアップ](setup.md#4-wi-fiで更新�
 
 [touchpad_gestures.h](../components/touchpad/include/touchpad_gestures.h) の `Config` に定義しています。
 現在のUIにこれらを変更する設定画面はありません。
+Navigator のカーソル移動は接続先が Linux のとき座標差の 1/4、
+Mac mini・MacBook Air のとき 1/8 をマウス移動量として送ります。
 
 | 項目 | 既定値 | 用途 |
 |---|---|---|
